@@ -1,4 +1,4 @@
-# Lab 1: Automatic Emergency Braking
+# Lab 6: Motion Planning
 
 ## Video Link
-(FILL ME IN)
+[Lab 6 - Occupancy Grid + RRT* on Real Car](https://youtube.com/shorts/wwESwwpVBxs?feature=share)
