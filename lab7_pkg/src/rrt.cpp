@@ -1,708 +1,432 @@
-// This file contains the class definition of tree nodes and RRT
-// Before you start, please read: https://arxiv.org/pdf/1105.1186.pdf
-//
-// ---- LAB 6 REQUIREMENTS CHECKLIST ----
-// [x] Occupancy grid (local frame, ray-traced, inflated, published for RVIZ/Foxglove)
-// [x] RRT: sample, nearest, steer, check_collision, is_goal, find_path
-// [x] RRT*: cost, line_cost, near, rewiring (extra credit)
-// [x] Collision checking with car width (corridor check)
-// [x] Trajectory execution via Pure Pursuit (built-in, no separate node needed)
-// [x] Visualization: tree (/rrt_tree), path (/rrt_path), goal (/rrt_goal), grid (/occupancy_grid)
-// [x] Wall-distance cost in RRT* to prefer corridor-center paths
-// [x] Goal-biased sampling (15% bias toward goal)
-// [x] Waypoint-based goal selection (from pure pursuit CSV)
-// [x] Handles straights and turns
-
 #include "rrt/rrt.h"
+#include <queue>
 
-// ============================================================================
-// Destructor
-// ============================================================================
 RRT::~RRT() {
-    RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "RRT shutting down");
+    RCLCPP_INFO(rclcpp::get_logger("RRT"), "RRT shutting down");
 }
 
-// ============================================================================
-// Constructor
-// ============================================================================
 RRT::RRT()
     : rclcpp::Node("rrt_node"),
       gen((std::random_device())()),
-      x_dist(0.5, 4.0),
-      y_dist(-2.5, 2.5)
+      x_dist(-0.5, 5.0),
+      y_dist(-3.5, 3.5)
 {
-    // Publishers
-    drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(
-        "/drive", 1);
-    occ_grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
-        "/occupancy_grid", 1);
-    tree_viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-        "/rrt_tree", 1);
-    path_viz_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
-        "/rrt_path", 1);
-    goal_viz_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
-        "/rrt_goal", 1);
+    drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>("/ackermann_cmd", 1);
+    occ_grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/occupancy_grid", 1);
+    tree_viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/rrt_tree", 1);
+    path_viz_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/rrt_path", 1);
+    goal_viz_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/rrt_goal", 1);
 
-    // Subscribers
-    string pose_topic = "ego_racecar/odom";
-    string scan_topic = "/scan";
     pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        pose_topic, 1,
-        std::bind(&RRT::pose_callback, this, std::placeholders::_1));
+        "/pf/pose/odom", 1, std::bind(&RRT::pose_callback, this, std::placeholders::_1));
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-        scan_topic, 1,
-        std::bind(&RRT::scan_callback, this, std::placeholders::_1));
+        "/scan", 1, std::bind(&RRT::scan_callback, this, std::placeholders::_1));
 
-    // Init grid
     occupancy_grid_.resize(GRID_WIDTH * GRID_HEIGHT, 0);
+    distance_grid_.resize(GRID_WIDTH * GRID_HEIGHT, 100.0f);
 
-    // ---- Load waypoints from your pure pursuit CSV ----
-    load_waypoints("/home/milan/roboracer_ws/src/lab-6-motion-planning-team8/lab7_pkg/waypoints.csv");
-
-    RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "Created new RRT Object.");
+    load_waypoints("/home/nvidia/f1tenth_ws/src/lab-6-motion-planning-team8/lab7_pkg/waypoints.csv");
+    RCLCPP_INFO(this->get_logger(), "RRT Node Ready (fast mode, no rewiring).");
 }
 
 // ============================================================================
-// load_waypoints — reads x,y per line from CSV
+// Waypoints
 // ============================================================================
+
 void RRT::load_waypoints(const std::string &filepath) {
     std::ifstream file(filepath);
     if (!file.is_open()) {
-        RCLCPP_WARN(rclcpp::get_logger("RRT"),
-            "Could not open waypoint file: %s — falling back to gap-finding", filepath.c_str());
+        RCLCPP_WARN(this->get_logger(), "Could not open waypoint file: %s", filepath.c_str());
         return;
     }
     std::string line;
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;  // skip comments/empty
+        if (line.empty() || line[0] == '#') continue;
         std::stringstream ss(line);
-        double x, y;
-        char comma;
-        if (ss >> x >> comma >> y) {
-            waypoints_.push_back({x, y});
-        }
+        double x, y; char comma;
+        if (ss >> x >> comma >> y) waypoints_.push_back({x, y});
     }
     if (!waypoints_.empty()) {
         use_waypoints_ = true;
-        RCLCPP_INFO(rclcpp::get_logger("RRT"), "Loaded %zu waypoints", waypoints_.size());
+        RCLCPP_INFO(this->get_logger(), "Loaded %zu waypoints", waypoints_.size());
     }
 }
 
-// ============================================================================
-// choose_goal_from_waypoints — pick a waypoint ahead of the car as the RRT goal
-//
-// This is the approach from the lecture slides (slide 60):
-//   "Choose a local goal from reference path (similar to pure pursuit)"
-//
-// 1. Find the nearest waypoint to the car
-// 2. Walk forward along the waypoint list by wp_lookahead_ distance
-// 3. Transform that waypoint into the car's local frame
-// 4. That becomes the RRT goal
-// ============================================================================
 void RRT::choose_goal_from_waypoints() {
     if (waypoints_.empty()) return;
 
-    // Step 1: Find nearest waypoint
     double min_dist = std::numeric_limits<double>::max();
     int nearest_idx = 0;
     for (size_t i = 0; i < waypoints_.size(); ++i) {
-        double dx = waypoints_[i].first - car_x_;
-        double dy = waypoints_[i].second - car_y_;
+        double dx = waypoints_[i].first - car_x_, dy = waypoints_[i].second - car_y_;
         double d = dx * dx + dy * dy;
-        if (d < min_dist) {
-            min_dist = d;
-            nearest_idx = static_cast<int>(i);
+        if (d < min_dist) { min_dist = d; nearest_idx = static_cast<int>(i); }
+    }
+
+    int best_goal_idx = -1;
+    double best_goal_x = 1.5, best_goal_y = 0.0;
+
+    for (double la = wp_lookahead_; la <= wp_lookahead_ * 4.0; la += 0.5) {
+        double accum = 0.0;
+        int goal_idx = nearest_idx;
+        for (size_t s = 0; s < waypoints_.size(); ++s) {
+            int curr = (nearest_idx + s) % waypoints_.size();
+            int next = (nearest_idx + s + 1) % waypoints_.size();
+            double ddx = waypoints_[next].first - waypoints_[curr].first;
+            double ddy = waypoints_[next].second - waypoints_[curr].second;
+            accum += std::sqrt(ddx * ddx + ddy * ddy);
+            if (accum >= la) { goal_idx = next; break; }
+        }
+
+        double dx = waypoints_[goal_idx].first - car_x_;
+        double dy = waypoints_[goal_idx].second - car_y_;
+        double cos_yaw = std::cos(-car_yaw_), sin_yaw = std::sin(-car_yaw_);
+        double lx = dx * cos_yaw - dy * sin_yaw;
+        double ly = dx * sin_yaw + dy * cos_yaw;
+        if (lx < 0.3) continue;
+        double gd = std::sqrt(lx * lx + ly * ly);
+        if (gd > 3.5) { lx = lx / gd * 3.5; ly = ly / gd * 3.5; }
+
+        if (!is_occupied_wide(lx, ly, car_half_width_)) {
+            best_goal_x = lx; best_goal_y = ly; best_goal_idx = goal_idx;
+            bool clear = true;
+            for (double t = 0.3; t < 0.8; t += 0.2)
+                if (is_occupied_wide(lx * t, ly * t, car_half_width_)) { clear = false; break; }
+            if (clear) break;
         }
     }
 
-    // Step 2: Walk forward along waypoints by wp_lookahead_ distance
-    double accum_dist = 0.0;
-    int goal_idx = nearest_idx;
-    for (size_t steps = 0; steps < waypoints_.size(); ++steps) {
-        int curr = (nearest_idx + steps) % waypoints_.size();
-        int next = (nearest_idx + steps + 1) % waypoints_.size();
-        double dx = waypoints_[next].first - waypoints_[curr].first;
-        double dy = waypoints_[next].second - waypoints_[curr].second;
-        accum_dist += std::sqrt(dx * dx + dy * dy);
-        if (accum_dist >= wp_lookahead_) {
-            goal_idx = next;
-            break;
+    if (best_goal_idx < 0) {
+        double accum = 0.0;
+        int goal_idx = nearest_idx;
+        for (size_t s = 0; s < waypoints_.size(); ++s) {
+            int curr = (nearest_idx + s) % waypoints_.size();
+            int next = (nearest_idx + s + 1) % waypoints_.size();
+            double ddx = waypoints_[next].first - waypoints_[curr].first;
+            double ddy = waypoints_[next].second - waypoints_[curr].second;
+            accum += std::sqrt(ddx * ddx + ddy * ddy);
+            if (accum >= wp_lookahead_) { goal_idx = next; break; }
         }
+        double dx = waypoints_[goal_idx].first - car_x_;
+        double dy = waypoints_[goal_idx].second - car_y_;
+        double cos_yaw = std::cos(-car_yaw_), sin_yaw = std::sin(-car_yaw_);
+        best_goal_x = dx * cos_yaw - dy * sin_yaw;
+        best_goal_y = dx * sin_yaw + dy * cos_yaw;
+        if (best_goal_x < 0.3) { best_goal_x = 1.5; best_goal_y = 0.0; }
+        double gd = std::sqrt(best_goal_x * best_goal_x + best_goal_y * best_goal_y);
+        if (gd > 3.5) { best_goal_x /= gd / 3.5; best_goal_y /= gd / 3.5; }
     }
 
-    // Step 3: Transform global waypoint → car-local frame
-    double dx = waypoints_[goal_idx].first - car_x_;
-    double dy = waypoints_[goal_idx].second - car_y_;
-    double cos_yaw = std::cos(-car_yaw_);
-    double sin_yaw = std::sin(-car_yaw_);
-    goal_x_ = dx * cos_yaw - dy * sin_yaw;
-    goal_y_ = dx * sin_yaw + dy * cos_yaw;
-
-    // Safety: if the goal ended up behind the car, push it forward
-    if (goal_x_ < 0.3) {
-        goal_x_ = 1.5;
-        goal_y_ = 0.0;
-    }
-
-    // Cap goal distance to stay within sampling region (max 3.5m)
-    double goal_dist = std::sqrt(goal_x_ * goal_x_ + goal_y_ * goal_y_);
-    if (goal_dist > 3.5) {
-        goal_x_ = goal_x_ / goal_dist * 3.5;
-        goal_y_ = goal_y_ / goal_dist * 3.5;
-    }
+    goal_x_ = best_goal_x;
+    goal_y_ = best_goal_y;
 }
 
 // ============================================================================
 // Grid helpers
 // ============================================================================
-int RRT::grid_col(double x_local) const {
-    return static_cast<int>(x_local / GRID_RESOLUTION);
-}
 
-int RRT::grid_row(double y_local) const {
-    return static_cast<int>(y_local / GRID_RESOLUTION) + GRID_HEIGHT / 2;
-}
+int RRT::grid_col(double x_local) const { return static_cast<int>(x_local / GRID_RESOLUTION); }
+int RRT::grid_row(double y_local) const { return static_cast<int>(y_local / GRID_RESOLUTION) + GRID_HEIGHT / 2; }
 
 bool RRT::is_occupied(double x, double y) const {
-    int c = grid_col(x);
-    int r = grid_row(y);
-    if (c < 0 || c >= GRID_WIDTH || r < 0 || r >= GRID_HEIGHT)
-        return true;
-    return occupancy_grid_[r * GRID_WIDTH + c] > 50;
+    int c = grid_col(x), r = grid_row(y);
+    if (c < 0 || c >= GRID_WIDTH || r < 0 || r >= GRID_HEIGHT) return true;
+    return occupancy_grid_[r * GRID_WIDTH + c] > OCC_THRESHOLD;
 }
 
 bool RRT::is_occupied_wide(double x, double y, double radius) const {
-    int cells = static_cast<int>(std::ceil(radius / GRID_RESOLUTION));
-    int cx = grid_col(x);
-    int cy = grid_row(y);
-    double r2 = radius * radius;
-    for (int dc = -cells; dc <= cells; ++dc) {
-        for (int dr = -cells; dr <= cells; ++dr) {
-            double real_dx = dc * GRID_RESOLUTION;
-            double real_dy = dr * GRID_RESOLUTION;
-            if (real_dx * real_dx + real_dy * real_dy > r2) continue;
-            int nc = cx + dc;
-            int nr = cy + dr;
-            if (nc < 0 || nc >= GRID_WIDTH || nr < 0 || nr >= GRID_HEIGHT)
-                return true;
-            if (occupancy_grid_[nr * GRID_WIDTH + nc] > 50)
-                return true;
-        }
-    }
-    return false;
+    return wall_distance(x, y) < radius;
 }
 
 double RRT::wall_distance(double x, double y) const {
-    int cx = grid_col(x);
-    int cy = grid_row(y);
-    int max_search = 20;
-    for (int radius = 1; radius <= max_search; ++radius) {
-        for (int dc = -radius; dc <= radius; ++dc) {
-            for (int dr = -radius; dr <= radius; ++dr) {
-                if (std::abs(dc) != radius && std::abs(dr) != radius) continue;
-                int nc = cx + dc;
-                int nr = cy + dr;
-                if (nc < 0 || nc >= GRID_WIDTH || nr < 0 || nr >= GRID_HEIGHT)
-                    return radius * GRID_RESOLUTION;
-                if (occupancy_grid_[nr * GRID_WIDTH + nc] > 50)
-                    return radius * GRID_RESOLUTION;
-            }
-        }
-    }
-    return max_search * GRID_RESOLUTION;
+    int c = grid_col(x), r = grid_row(y);
+    if (c < 0 || c >= GRID_WIDTH || r < 0 || r >= GRID_HEIGHT) return 0.0;
+    return static_cast<double>(distance_grid_[r * GRID_WIDTH + c]);
 }
 
 // ============================================================================
-// scan_callback — build occupancy grid
-//
-// If using waypoints: goal is set in pose_callback, NOT here.
-// If NOT using waypoints: falls back to gap-finding goal (corridor center).
+// Scan callback
 // ============================================================================
+
 void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg) {
-    // ---------- 1. Occupancy grid ----------
-    // Start FREE — unseen areas (like around corners) are passable.
-    // Only laser endpoints are marked occupied. This lets the RRT tree
-    // grow toward waypoints the laser can't see yet.
-    std::fill(occupancy_grid_.begin(), occupancy_grid_.end(), 0);
+    std::fill(occupancy_grid_.begin(), occupancy_grid_.end(), static_cast<int8_t>(0));
+    std::fill(distance_grid_.begin(), distance_grid_.end(), 100.0f);
 
     double angle = scan_msg->angle_min;
     for (size_t i = 0; i < scan_msg->ranges.size(); ++i) {
         double r = scan_msg->ranges[i];
-        if (std::isnan(r) || std::isinf(r) ||
-            r < scan_msg->range_min || r > scan_msg->range_max) {
-            angle += scan_msg->angle_increment;
-            continue;
-        }
+        if (std::isnan(r) || std::isinf(r) || r < 0.35) { angle += scan_msg->angle_increment; continue; }
 
-        // Mark endpoint + circular inflation as occupied
-        double cos_a = std::cos(angle);
-        double sin_a = std::sin(angle);
-        int gc = grid_col(r * cos_a);
-        int gr = grid_row(r * sin_a);
-        for (int dc = -inflate_cells_; dc <= inflate_cells_; ++dc) {
-            for (int dr = -inflate_cells_; dr <= inflate_cells_; ++dr) {
-                if (dc * dc + dr * dr > inflate_cells_ * inflate_cells_) continue;
-                int nc = gc + dc;
-                int nr = gr + dr;
-                if (nc >= 0 && nc < GRID_WIDTH && nr >= 0 && nr < GRID_HEIGHT)
-                    occupancy_grid_[nr * GRID_WIDTH + nc] = 100;
-            }
-        }
+        double r_clamped = std::min(r, static_cast<double>(GRID_WIDTH) * GRID_RESOLUTION * 0.9);
+        int gc = grid_col(r_clamped * std::cos(angle));
+        int gr = grid_row(r_clamped * std::sin(angle));
+        if (gc >= 0 && gc < GRID_WIDTH && gr >= 0 && gr < GRID_HEIGHT)
+            occupancy_grid_[gr * GRID_WIDTH + gc] = 100;
+
         angle += scan_msg->angle_increment;
     }
 
-    // ---------- 2. Fallback gap-finding goal (only if no waypoints) ----------
-    if (!use_waypoints_) {
-        int num_beams = static_cast<int>(scan_msg->ranges.size());
-        double best_score = -1.0;
-        int best_idx = num_beams / 2;
-        int start_beam = num_beams / 4;
-        int end_beam   = 3 * num_beams / 4;
-
-        for (int i = start_beam; i < end_beam; ++i) {
-            double r = scan_msg->ranges[i];
-            if (std::isnan(r) || std::isinf(r) || r < 0.5) continue;
-            double a = scan_msg->angle_min + i * scan_msg->angle_increment;
-            double sample_dist = std::min(r * 0.7, 2.0);
-            double px = sample_dist * std::cos(a);
-            double py = sample_dist * std::sin(a);
-
-            double perp_x = -std::sin(a);
-            double perp_y =  std::cos(a);
-            double left_dist = 0.0;
-            for (double d = 0.05; d < 2.0; d += 0.05) {
-                if (is_occupied(px + perp_x * d, py + perp_y * d)) break;
-                left_dist = d;
-            }
-            double right_dist = 0.0;
-            for (double d = 0.05; d < 2.0; d += 0.05) {
-                if (is_occupied(px - perp_x * d, py - perp_y * d)) break;
-                right_dist = d;
-            }
-
-            double corridor_width = left_dist + right_dist;
-            double min_side = std::min(left_dist, right_dist);
-            if (min_side < car_half_width_ + 0.10) continue;
-
-            double center_offset = std::abs(i - num_beams / 2.0) / (num_beams / 4.0);
-            double center_bias = 1.0 - 0.3 * center_offset;
-            double score = corridor_width * std::min(r, 3.0) * center_bias;
-
-            if (score > best_score) {
-                best_score = score;
-                best_idx = i;
+    // Light inflation
+    if (inflate_cells_ > 0) {
+        std::vector<int8_t> raw = occupancy_grid_;
+        int r2 = inflate_cells_ * inflate_cells_;
+        for (int r = 0; r < GRID_HEIGHT; ++r) {
+            for (int c = 0; c < GRID_WIDTH; ++c) {
+                if (raw[r * GRID_WIDTH + c] <= OCC_THRESHOLD) continue;
+                for (int dr = -inflate_cells_; dr <= inflate_cells_; ++dr) {
+                    for (int dc = -inflate_cells_; dc <= inflate_cells_; ++dc) {
+                        if (dr * dr + dc * dc > r2) continue;
+                        int nr = r + dr, nc = c + dc;
+                        if (nr >= 0 && nr < GRID_HEIGHT && nc >= 0 && nc < GRID_WIDTH)
+                            occupancy_grid_[nr * GRID_WIDTH + nc] = 100;
+                    }
+                }
             }
         }
+    }
 
-        double best_angle = scan_msg->angle_min + best_idx * scan_msg->angle_increment;
-        double br = scan_msg->ranges[best_idx];
-        if (std::isnan(br) || std::isinf(br)) br = 2.0;
-        double sd = std::min(br * 0.6, 2.5);
-        if (sd < 1.0) sd = 1.0;
-
-        double px = sd * std::cos(best_angle);
-        double py = sd * std::sin(best_angle);
-        double perp_x = -std::sin(best_angle);
-        double perp_y =  std::cos(best_angle);
-        double ld = 0.0, rd = 0.0;
-        for (double d = 0.05; d < 2.0; d += 0.05) {
-            if (is_occupied(px + perp_x * d, py + perp_y * d)) break;
-            ld = d;
+    // BFS distance transform
+    std::queue<std::pair<int, int>> q;
+    for (int i = 0; i < GRID_WIDTH * GRID_HEIGHT; ++i) {
+        if (occupancy_grid_[i] > OCC_THRESHOLD) {
+            distance_grid_[i] = 0.0f;
+            q.push({i / GRID_WIDTH, i % GRID_WIDTH});
         }
-        for (double d = 0.05; d < 2.0; d += 0.05) {
-            if (is_occupied(px - perp_x * d, py - perp_y * d)) break;
-            rd = d;
-        }
-        double shift = (ld - rd) / 2.0;
-        goal_x_ = px - perp_x * shift;
-        goal_y_ = py - perp_y * shift;
-
-        double goal_angle = std::atan2(goal_y_, goal_x_);
-        if (std::abs(goal_angle) > 1.0) {
-            double clamped = std::clamp(goal_angle, -1.0, 1.0);
-            double dist = std::sqrt(goal_x_ * goal_x_ + goal_y_ * goal_y_);
-            goal_x_ = dist * std::cos(clamped);
-            goal_y_ = dist * std::sin(clamped);
+    }
+    int ddr[] = {-1, 1, 0, 0, -1, -1, 1, 1};
+    int ddc[] = {0, 0, -1, 1, -1, 1, -1, 1};
+    while (!q.empty()) {
+        auto [cr, cc] = q.front(); q.pop();
+        float d = distance_grid_[cr * GRID_WIDTH + cc];
+        for (int i = 0; i < 8; i++) {
+            int nr = cr + ddr[i], nc = cc + ddc[i];
+            if (nr >= 0 && nr < GRID_HEIGHT && nc >= 0 && nc < GRID_WIDTH) {
+                float di = (i < 4) ? (float)GRID_RESOLUTION : (float)GRID_RESOLUTION * 1.414f;
+                if (distance_grid_[nr * GRID_WIDTH + nc] > d + di) {
+                    distance_grid_[nr * GRID_WIDTH + nc] = d + di;
+                    q.push({nr, nc});
+                }
+            }
         }
     }
 
     scan_received_ = true;
 
-    // ---------- 3. Publish occupancy grid ----------
-    nav_msgs::msg::OccupancyGrid grid_msg;
-    grid_msg.header.stamp    = this->now();
-    grid_msg.header.frame_id = "ego_racecar/base_link";
-    grid_msg.info.resolution = GRID_RESOLUTION;
-    grid_msg.info.width      = GRID_WIDTH;
-    grid_msg.info.height     = GRID_HEIGHT;
-    grid_msg.info.origin.position.x = 0.0;
-    grid_msg.info.origin.position.y = -(GRID_HEIGHT / 2) * GRID_RESOLUTION;
-    grid_msg.info.origin.position.z = 0.0;
-    grid_msg.data = occupancy_grid_;
-    occ_grid_pub_->publish(grid_msg);
+    nav_msgs::msg::OccupancyGrid gm;
+    gm.header.stamp = this->now(); gm.header.frame_id = "base_link";
+    gm.info.resolution = GRID_RESOLUTION; gm.info.width = GRID_WIDTH; gm.info.height = GRID_HEIGHT;
+    gm.info.origin.position.y = -(GRID_HEIGHT / 2) * GRID_RESOLUTION;
+    gm.data = occupancy_grid_;
+    occ_grid_pub_->publish(gm);
 }
 
 // ============================================================================
-// pose_callback — RRT MAIN LOOP
+// Pose callback — FAST RRT (no rewiring)
 // ============================================================================
+
 void RRT::pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) {
     if (!scan_received_) return;
 
-    // Extract car pose
     car_x_ = pose_msg->pose.pose.position.x;
     car_y_ = pose_msg->pose.pose.position.y;
-    double qx = pose_msg->pose.pose.orientation.x;
-    double qy = pose_msg->pose.pose.orientation.y;
-    double qz = pose_msg->pose.pose.orientation.z;
-    double qw = pose_msg->pose.pose.orientation.w;
-    car_yaw_ = std::atan2(2.0 * (qw * qz + qx * qy),
-                           1.0 - 2.0 * (qy * qy + qz * qz));
+    double qx = pose_msg->pose.pose.orientation.x, qy = pose_msg->pose.pose.orientation.y;
+    double qz = pose_msg->pose.pose.orientation.z, qw = pose_msg->pose.pose.orientation.w;
+    car_yaw_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
 
-    // ---- Set goal from waypoints (if loaded) ----
-    if (use_waypoints_) {
-        choose_goal_from_waypoints();
-    }
+    if (use_waypoints_) choose_goal_from_waypoints();
 
-    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("RRT"), *this->get_clock(), 1000,
-        "Car: (%.1f, %.1f, yaw=%.2f) Goal local: (%.2f, %.2f) Waypoints: %s",
-        car_x_, car_y_, car_yaw_, goal_x_, goal_y_,
-        use_waypoints_ ? "YES" : "NO (gap-finding)");
-
-    // ---- Build tree ----
     std::vector<RRT_Node> tree;
-    RRT_Node root;
-    root.x = 0.0; root.y = 0.0;
-    root.cost = 0.0; root.parent = -1; root.is_root = true;
-    tree.push_back(root);
+    tree.reserve(max_rrt_iters_ + 1);
+    tree.push_back({0.0, 0.0, 0.0, -1, true});
+    double gx = goal_x_, gy = goal_y_;
 
-    double gx = goal_x_;
-    double gy = goal_y_;
+    // Goal marker
+    visualization_msgs::msg::Marker gm;
+    gm.header.frame_id = "base_link"; gm.header.stamp = this->now();
+    gm.type = visualization_msgs::msg::Marker::SPHERE;
+    gm.pose.position.x = gx; gm.pose.position.y = gy;
+    gm.scale.x = 0.3; gm.scale.y = 0.3; gm.scale.z = 0.3;
+    gm.color.b = 1.0; gm.color.a = 1.0;
+    goal_viz_pub_->publish(gm);
 
-    // Publish goal marker
-    {
-        visualization_msgs::msg::Marker gm;
-        gm.header.frame_id = "ego_racecar/base_link";
-        gm.header.stamp = this->now();
-        gm.ns = "goal"; gm.id = 0;
-        gm.type = visualization_msgs::msg::Marker::SPHERE;
-        gm.action = visualization_msgs::msg::Marker::ADD;
-        gm.pose.position.x = gx; gm.pose.position.y = gy;
-        gm.scale.x = 0.3; gm.scale.y = 0.3; gm.scale.z = 0.3;
-        gm.color.b = 1.0; gm.color.a = 1.0;
-        goal_viz_pub_->publish(gm);
-    }
-
-    bool path_found    = false;
-    int  goal_node_idx = -1;
+    // ---- FAST RRT: no near(), no rewiring ----
+    // Each iteration: sample → nearest → steer → collision check → add
+    // Cost: O(n) for nearest only. No neighbor scanning.
+    bool path_found = false;
+    int goal_node_idx = -1;
     std::uniform_real_distribution<> bias_dist(0.0, 1.0);
+    bool goal_blocked = is_occupied_wide(gx, gy, car_half_width_);
 
-    // ---- RRT main loop ----
     for (int iter = 0; iter < max_rrt_iters_; ++iter) {
-        // 1) Sample — 15% goal bias
-        std::vector<double> sampled(2);
-        if (bias_dist(gen) < 0.15) {
-            sampled[0] = gx;
-            sampled[1] = gy;
-        } else {
-            sampled = sample();
-        }
+        // Sample with goal bias
+        double bias = goal_blocked ? 0.08 : goal_bias_;
+        std::vector<double> sampled = (bias_dist(gen) < bias)
+            ? std::vector<double>{gx, gy} : sample();
 
-        // 2) Nearest
+        // Find nearest node in tree
         int nearest_idx = nearest(tree, sampled);
 
-        // 3) Steer
+        // Steer toward sample
         RRT_Node new_node = steer(tree[nearest_idx], sampled);
 
-        // 4) Collision check (car-width corridor)
-        if (check_collision(tree[nearest_idx], new_node))
-            continue;
+        // Quick point check (fast reject)
+        if (is_occupied_wide(new_node.x, new_node.y, car_half_width_)) continue;
 
-        // Reject node too close to walls
-        if (is_occupied_wide(new_node.x, new_node.y, car_half_width_))
-            continue;
+        // Edge collision check
+        if (check_collision(tree[nearest_idx], new_node)) continue;
 
+        // Add to tree — simple parent, no rewiring
         new_node.parent = nearest_idx;
-        new_node.cost   = tree[nearest_idx].cost
-                        + line_cost(tree[nearest_idx], new_node);
-
-        // ---- RRT* rewiring ----
-        std::vector<int> neighbours = near(tree, new_node);
-        for (int ni : neighbours) {
-            double tentative = tree[ni].cost + line_cost(tree[ni], new_node);
-            if (tentative < new_node.cost) {
-                if (!check_collision(tree[ni], new_node)) {
-                    new_node.parent = ni;
-                    new_node.cost   = tentative;
-                }
-            }
-        }
+        new_node.cost = tree[nearest_idx].cost +
+            std::sqrt(std::pow(new_node.x - tree[nearest_idx].x, 2) +
+                      std::pow(new_node.y - tree[nearest_idx].y, 2));
         tree.push_back(new_node);
-        int new_idx = static_cast<int>(tree.size()) - 1;
-        for (int ni : neighbours) {
-            double tentative = new_node.cost + line_cost(new_node, tree[ni]);
-            if (tentative < tree[ni].cost) {
-                if (!check_collision(new_node, tree[ni])) {
-                    tree[ni].parent = new_idx;
-                    tree[ni].cost   = tentative;
-                }
-            }
-        }
 
-        // 5) Goal check
         if (is_goal(new_node, gx, gy)) {
-            path_found    = true;
-            goal_node_idx = new_idx;
+            path_found = true;
+            goal_node_idx = tree.size() - 1;
             break;
         }
     }
 
-    // ---- Visualise tree ----
-    {
-        visualization_msgs::msg::MarkerArray tree_markers;
-        visualization_msgs::msg::Marker edges;
-        edges.header.frame_id = "ego_racecar/base_link";
-        edges.header.stamp = this->now();
-        edges.ns = "tree"; edges.id = 0;
-        edges.type = visualization_msgs::msg::Marker::LINE_LIST;
-        edges.action = visualization_msgs::msg::Marker::ADD;
-        edges.scale.x = 0.01;
-        edges.color.g = 1.0; edges.color.a = 0.4;
+    // Partial path fallback
+    if (!path_found && tree.size() > 5) {
+        // Pass 1: good clearance, closest to goal
+        double best = 1e9;
         for (size_t i = 1; i < tree.size(); ++i) {
-            if (tree[i].parent < 0) continue;
-            geometry_msgs::msg::Point p1, p2;
-            p1.x = tree[tree[i].parent].x; p1.y = tree[tree[i].parent].y;
-            p2.x = tree[i].x; p2.y = tree[i].y;
-            edges.points.push_back(p1);
-            edges.points.push_back(p2);
+            double wd = wall_distance(tree[i].x, tree[i].y);
+            if (wd < car_half_width_ * 1.5 || tree[i].x < 0.1) continue;
+            double d2g = std::pow(tree[i].x - gx, 2) + std::pow(tree[i].y - gy, 2);
+            double score = d2g - std::min(wd, 1.0) * 0.3;
+            if (score < best) { best = score; goal_node_idx = i; }
         }
-        tree_markers.markers.push_back(edges);
-        tree_viz_pub_->publish(tree_markers);
+        // Pass 2: relaxed — bare minimum clearance
+        if (goal_node_idx <= 0) {
+            best = 1e9;
+            for (size_t i = 1; i < tree.size(); ++i) {
+                double wd = wall_distance(tree[i].x, tree[i].y);
+                if (wd < car_half_width_ || tree[i].x < 0.05) continue;
+                double d2g = std::pow(tree[i].x - gx, 2) + std::pow(tree[i].y - gy, 2);
+                if (d2g < best) { best = d2g; goal_node_idx = i; }
+            }
+        }
+        if (goal_node_idx > 0) path_found = true;
     }
 
-    // ---- Fallback if no path found ----
+    // Visualize tree
+    visualization_msgs::msg::MarkerArray tm;
+    visualization_msgs::msg::Marker edges;
+    edges.header.frame_id = "base_link"; edges.header.stamp = this->now();
+    edges.type = visualization_msgs::msg::Marker::LINE_LIST;
+    edges.scale.x = 0.01; edges.color.g = 1.0; edges.color.a = 0.4;
+    for (size_t i = 1; i < tree.size(); ++i) {
+        if (tree[i].parent < 0) continue;
+        geometry_msgs::msg::Point p1, p2;
+        p1.x = tree[tree[i].parent].x; p1.y = tree[tree[i].parent].y;
+        p2.x = tree[i].x; p2.y = tree[i].y;
+        edges.points.push_back(p1); edges.points.push_back(p2);
+    }
+    tm.markers.push_back(edges);
+    tree_viz_pub_->publish(tm);
+
+    // Drive
     if (!path_found) {
-        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("RRT"), *this->get_clock(), 500,
-            "No path found — tree has %zu nodes, goal at (%.2f, %.2f), goal occupied: %s",
-            tree.size(), gx, gy,
-            is_occupied(gx, gy) ? "YES" : "no");
-        double angle_to_goal = std::atan2(gy, gx);
-        double steering = std::clamp(angle_to_goal, -0.4189, 0.4189);
-        auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
-        drive_msg.drive.steering_angle = steering;
-        drive_msg.drive.speed          = 0.3;
-        drive_pub_->publish(drive_msg);
+        auto msg = ackermann_msgs::msg::AckermannDriveStamped();
+        msg.drive.speed = 0.0; msg.drive.steering_angle = 0.0;
+        drive_pub_->publish(msg);
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "RRT: STOPPED — no path, tree=%zu", tree.size());
         return;
     }
 
-    // ---- Extract & visualise path ----
     std::vector<RRT_Node> path = find_path(tree, tree[goal_node_idx]);
-    {
-        visualization_msgs::msg::Marker pm;
-        pm.header.frame_id = "ego_racecar/base_link";
-        pm.header.stamp = this->now();
-        pm.ns = "path"; pm.id = 0;
-        pm.type = visualization_msgs::msg::Marker::LINE_STRIP;
-        pm.action = visualization_msgs::msg::Marker::ADD;
-        pm.scale.x = 0.05;
-        pm.color.r = 1.0; pm.color.a = 1.0;
-        for (auto &n : path) {
-            geometry_msgs::msg::Point p;
-            p.x = n.x; p.y = n.y; p.z = 0.0;
-            pm.points.push_back(p);
-        }
-        path_viz_pub_->publish(pm);
-    }
 
-    // ---- Pure Pursuit on the RRT path ----
-    double tx = path.back().x;
-    double ty = path.back().y;
+    // Visualize path
+    visualization_msgs::msg::Marker pm;
+    pm.header.frame_id = "base_link"; pm.header.stamp = this->now();
+    pm.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    pm.scale.x = 0.05;
+    pm.color.r = 1.0; pm.color.g = 0.2; pm.color.b = 0.2; pm.color.a = 1.0;
     for (auto &n : path) {
-        double d = std::sqrt(n.x * n.x + n.y * n.y);
-        if (d >= lookahead_) {
-            tx = n.x; ty = n.y;
-            break;
-        }
+        geometry_msgs::msg::Point p; p.x = n.x; p.y = n.y;
+        pm.points.push_back(p);
+    }
+    path_viz_pub_->publish(pm);
+
+    // Pure pursuit
+    double tx = path.back().x, ty = path.back().y;
+    for (auto &n : path) {
+        if (std::sqrt(n.x * n.x + n.y * n.y) >= lookahead_) { tx = n.x; ty = n.y; break; }
     }
 
-    double L = std::sqrt(tx * tx + ty * ty);
-    if (L < 0.001) L = 0.001;
-    double curvature = 2.0 * ty / (L * L);
-    double steering  = std::atan(curvature * 0.3302);
+    double L2 = tx * tx + ty * ty;
+    double steering = std::atan((2.0 * ty / std::max(L2, 0.001)) * 0.3302);
     steering = std::clamp(steering, -0.4189, 0.4189);
 
-    double speed = 3.0;
-    if (std::abs(steering) > 0.10) speed = 2.5;
-    if (std::abs(steering) > 0.25) speed = 2.0;
-
-    auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
-    drive_msg.drive.steering_angle = steering;
-    drive_msg.drive.speed          = speed;
-    drive_pub_->publish(drive_msg);
+    auto msg = ackermann_msgs::msg::AckermannDriveStamped();
+    msg.drive.steering_angle = steering;
+    msg.drive.speed = (std::abs(steering) > steer_threshold_) ? speed_corner_ : speed_straight_;
+    drive_pub_->publish(msg);
 }
 
 // ============================================================================
-// sample
+// RRT methods
 // ============================================================================
+
 std::vector<double> RRT::sample() {
-    std::vector<double> sampled_point(2);
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        double sx = x_dist(gen);
-        double sy = y_dist(gen);
-        if (!is_occupied_wide(sx, sy, car_half_width_)) {
-            sampled_point[0] = sx;
-            sampled_point[1] = sy;
-            return sampled_point;
-        }
+    for (int a = 0; a < 30; ++a) {
+        double sx = x_dist(gen), sy = y_dist(gen);
+        if (wall_distance(sx, sy) > car_half_width_) return {sx, sy};
     }
-    sampled_point[0] = x_dist(gen);
-    sampled_point[1] = y_dist(gen);
-    return sampled_point;
+    return {x_dist(gen), y_dist(gen)};
 }
 
-// ============================================================================
-// nearest
-// ============================================================================
-int RRT::nearest(std::vector<RRT_Node> &tree, std::vector<double> &sampled_point) {
-    int nearest_node = 0;
-    double min_dist  = std::numeric_limits<double>::max();
+int RRT::nearest(std::vector<RRT_Node> &tree, std::vector<double> &sampled) {
+    int nid = 0; double min_d = 1e9;
     for (size_t i = 0; i < tree.size(); ++i) {
-        double dx = tree[i].x - sampled_point[0];
-        double dy = tree[i].y - sampled_point[1];
-        double d2 = dx * dx + dy * dy;
-        if (d2 < min_dist) {
-            min_dist     = d2;
-            nearest_node = static_cast<int>(i);
-        }
+        double d = (tree[i].x - sampled[0]) * (tree[i].x - sampled[0]) +
+                   (tree[i].y - sampled[1]) * (tree[i].y - sampled[1]);
+        if (d < min_d) { min_d = d; nid = i; }
     }
-    return nearest_node;
+    return nid;
 }
 
-// ============================================================================
-// steer
-// ============================================================================
-RRT_Node RRT::steer(RRT_Node &nearest_node, std::vector<double> &sampled_point) {
-    RRT_Node new_node;
-    double dx   = sampled_point[0] - nearest_node.x;
-    double dy   = sampled_point[1] - nearest_node.y;
-    double dist = std::sqrt(dx * dx + dy * dy);
-
-    if (dist <= max_expansion_dist_) {
-        new_node.x = sampled_point[0];
-        new_node.y = sampled_point[1];
-    } else {
-        new_node.x = nearest_node.x + (dx / dist) * max_expansion_dist_;
-        new_node.y = nearest_node.y + (dy / dist) * max_expansion_dist_;
-    }
-    new_node.cost    = 0.0;
-    new_node.parent  = -1;
-    new_node.is_root = false;
-    return new_node;
+RRT_Node RRT::steer(RRT_Node &nearest, std::vector<double> &sampled) {
+    double dx = sampled[0] - nearest.x, dy = sampled[1] - nearest.y;
+    double d = std::sqrt(dx * dx + dy * dy);
+    if (d < 1e-6) return {nearest.x, nearest.y, 0.0, -1, false};
+    double step = std::min(d, max_expansion_dist_);
+    return {nearest.x + (dx / d) * step, nearest.y + (dy / d) * step, 0.0, -1, false};
 }
 
-// ============================================================================
-// check_collision — car-width corridor check
-//   Returns TRUE if collision
-// ============================================================================
-bool RRT::check_collision(RRT_Node &nearest_node, RRT_Node &new_node) {
-    double dx   = new_node.x - nearest_node.x;
-    double dy   = new_node.y - nearest_node.y;
-    double dist = std::sqrt(dx * dx + dy * dy);
-    if (dist < 1e-6) return is_occupied_wide(new_node.x, new_node.y, car_half_width_);
-
-    double ux = dx / dist;
-    double uy = dy / dist;
-    double nx = -uy;
-    double ny =  ux;
-
-    double step      = GRID_RESOLUTION * 0.5;
-    int    num_steps = static_cast<int>(std::ceil(dist / step));
-
-    for (int i = 0; i <= num_steps; ++i) {
-        double t  = (num_steps == 0) ? 0.0 : static_cast<double>(i) / num_steps;
-        double cx = nearest_node.x + t * dx;
-        double cy = nearest_node.y + t * dy;
-
-        if (is_occupied(cx, cy)) return true;
-        if (is_occupied(cx + nx * car_half_width_, cy + ny * car_half_width_)) return true;
-        if (is_occupied(cx - nx * car_half_width_, cy - ny * car_half_width_)) return true;
+bool RRT::check_collision(RRT_Node &n1, RRT_Node &n2) {
+    double dx = n2.x - n1.x, dy = n2.y - n1.y;
+    double d = std::sqrt(dx * dx + dy * dy);
+    // Step at grid resolution (not half — faster)
+    int steps = static_cast<int>(std::ceil(d / GRID_RESOLUTION));
+    for (int i = 0; i <= steps; ++i) {
+        double t = static_cast<double>(i) / std::max(steps, 1);
+        if (is_occupied_wide(n1.x + t * dx, n1.y + t * dy, car_half_width_)) return true;
     }
     return false;
 }
 
-// ============================================================================
-// is_goal
-// ============================================================================
-bool RRT::is_goal(RRT_Node &latest_added_node, double goal_x, double goal_y) {
-    double dx = latest_added_node.x - goal_x;
-    double dy = latest_added_node.y - goal_y;
-    return std::sqrt(dx * dx + dy * dy) < goal_threshold_;
+bool RRT::is_goal(RRT_Node &n, double gx, double gy) {
+    return (n.x - gx) * (n.x - gx) + (n.y - gy) * (n.y - gy) < goal_threshold_ * goal_threshold_;
 }
 
-// ============================================================================
-// find_path
-// ============================================================================
-std::vector<RRT_Node> RRT::find_path(std::vector<RRT_Node> &tree,
-                                      RRT_Node &latest_added_node) {
-    std::vector<RRT_Node> found_path;
-    int current = -1;
-    for (size_t i = 0; i < tree.size(); ++i) {
-        if (&tree[i] == &latest_added_node) {
-            current = static_cast<int>(i);
-            break;
-        }
-    }
-    if (current < 0) return found_path;
-    while (current != -1) {
-        found_path.push_back(tree[current]);
-        current = tree[current].parent;
-    }
-    std::reverse(found_path.begin(), found_path.end());
-    return found_path;
-}
-
-// ============================================================================
-// RRT* methods
-// ============================================================================
-double RRT::cost(std::vector<RRT_Node> &tree, RRT_Node &node) {
-    double c = 0.0;
-    int idx = -1;
-    for (size_t i = 0; i < tree.size(); ++i) {
-        if (&tree[i] == &node) { idx = static_cast<int>(i); break; }
-    }
-    if (idx < 0) return 0.0;
-    int current = idx;
-    while (tree[current].parent != -1) {
-        int p = tree[current].parent;
-        c += line_cost(tree[p], tree[current]);
-        current = p;
-    }
-    return c;
+std::vector<RRT_Node> RRT::find_path(std::vector<RRT_Node> &tree, RRT_Node &last) {
+    std::vector<RRT_Node> path;
+    int curr = -1;
+    for (size_t i = 0; i < tree.size(); ++i)
+        if (&tree[i] == &last) { curr = i; break; }
+    while (curr != -1) { path.push_back(tree[curr]); curr = tree[curr].parent; }
+    std::reverse(path.begin(), path.end());
+    return path;
 }
 
 double RRT::line_cost(RRT_Node &n1, RRT_Node &n2) {
-    double dx = n1.x - n2.x;
-    double dy = n1.y - n2.y;
-    double euclidean = std::sqrt(dx * dx + dy * dy);
-
-    double mx = (n1.x + n2.x) / 2.0;
-    double my = (n1.y + n2.y) / 2.0;
-    double wd = wall_distance(mx, my);
-
-    double max_wd = 1.0;
-    double clamped_wd = std::min(wd, max_wd);
-    double wall_penalty = wall_cost_weight_ * euclidean * (1.0 - clamped_wd / max_wd);
-
-    return euclidean + wall_penalty;
-}
-
-std::vector<int> RRT::near(std::vector<RRT_Node> &tree, RRT_Node &node) {
-    std::vector<int> neighborhood;
-    double r2 = search_radius_ * search_radius_;
-    for (size_t i = 0; i < tree.size(); ++i) {
-        double dx = tree[i].x - node.x;
-        double dy = tree[i].y - node.y;
-        if (dx * dx + dy * dy <= r2)
-            neighborhood.push_back(static_cast<int>(i));
-    }
-    return neighborhood;
+    double d = std::sqrt((n1.x - n2.x) * (n1.x - n2.x) + (n1.y - n2.y) * (n1.y - n2.y));
+    double wd = wall_distance((n1.x + n2.x) / 2.0, (n1.y + n2.y) / 2.0);
+    return d + (wd < 1.0 ? wall_cost_weight_ * d * (1.0 - wd) : 0.0);
 }

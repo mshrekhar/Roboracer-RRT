@@ -37,9 +37,9 @@ class RRT(Node):
         super().__init__('rrt_node')
 
         # ── Parameters ──────────────────────────────────────────────────────
-        self.declare_parameter('pose_topic',       'ego_racecar/odom')
+        self.declare_parameter('pose_topic',       '/odom')
         self.declare_parameter('scan_topic',       '/scan')
-        self.declare_parameter('drive_topic',      '/drive')
+        self.declare_parameter('drive_topic',      '/ackermann_cmd')
 
         # RRT settings
         self.declare_parameter('goal_threshold',   0.3)
@@ -399,7 +399,7 @@ class RRT(Node):
     def _publish_path(self, path, stamp):
         m = Marker()
         m.header.stamp    = stamp
-        m.header.frame_id = 'ego_racecar/base_link'
+        m.header.frame_id = 'base_link'
         m.ns              = 'rrt_path'
         m.id              = 1
         m.type            = Marker.LINE_STRIP

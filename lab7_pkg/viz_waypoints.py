@@ -10,7 +10,7 @@ from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
 import csv
 
-WAYPOINT_FILE = "/home/milan/roboracer_ws/src/lab-6-motion-planning-team8/lab7_pkg/waypoints.csv"
+WAYPOINT_FILE = "/home/nvidia/f1tenth_ws/src/lab-6-motion-planning-team8/lab7_pkg/waypoints.csv"
 
 class WaypointViz(Node):
     def __init__(self):
